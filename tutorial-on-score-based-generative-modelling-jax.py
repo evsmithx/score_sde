@@ -96,7 +96,8 @@ import optax
 import tensorflow as tf
 import torch
 import torchvision.transforms as transforms
-import tqdm
+# import tqdm
+from tqdm import trange, tqdm
 
 from flax.serialization import to_bytes, from_bytes
 from scipy import integrate
@@ -175,17 +176,17 @@ class ScoreNet(nn.Module):
         h2 = nn.Conv(self.channels[1], (3, 3), (2, 2), padding='VALID',
                      use_bias=False)(h1)
         h2 += Dense(self.channels[1])(embed)
-        h2 = nn.GroupNorm()(h2)
+        h2 = nn.GroupNorm(4)(h2)
         h2 = act(h2)
         h3 = nn.Conv(self.channels[2], (3, 3), (2, 2), padding='VALID',
                      use_bias=False)(h2)
         h3 += Dense(self.channels[2])(embed)
-        h3 = nn.GroupNorm()(h3)
+        h3 = nn.GroupNorm(4)(h3)
         h3 = act(h3)
         h4 = nn.Conv(self.channels[3], (3, 3), (2, 2), padding='VALID',
                      use_bias=False)(h3)
         h4 += Dense(self.channels[3])(embed)
-        h4 = nn.GroupNorm()(h4)
+        h4 = nn.GroupNorm(4)(h4)
         h4 = act(h4)
 
         # Decoding path
@@ -193,22 +194,120 @@ class ScoreNet(nn.Module):
                     input_dilation=(2, 2), use_bias=False)(h4)
         ## Skip connection from the encoding path
         h += Dense(self.channels[2])(embed)
-        h = nn.GroupNorm()(h)
+        h = nn.GroupNorm(4)(h)
         h = act(h)
         h = nn.Conv(self.channels[1], (3, 3), (1, 1), padding=((2, 3), (2, 3)),
                     input_dilation=(2, 2), use_bias=False)(
             jnp.concatenate([h, h3], axis=-1)
         )
         h += Dense(self.channels[1])(embed)
-        h = nn.GroupNorm()(h)
+        h = nn.GroupNorm(4)(h)
         h = act(h)
         h = nn.Conv(self.channels[0], (3, 3), (1, 1), padding=((2, 3), (2, 3)),
                     input_dilation=(2, 2), use_bias=False)(
             jnp.concatenate([h, h2], axis=-1)
         )
         h += Dense(self.channels[0])(embed)
-        h = nn.GroupNorm()(h)
+        h = nn.GroupNorm(4)(h)
         h = act(h)
+        h = nn.Conv(1, (3, 3), (1, 1), padding=((2, 2), (2, 2)))(
+            jnp.concatenate([h, h1], axis=-1)
+        )
+
+        # Normalize output
+        h = h / self.marginal_prob_std(t)[:, None, None, None]
+        return h
+
+
+class TinyScoreNet(nn.Module):
+    """A time-dependent score-based model built upon U-Net architecture.
+
+    Args:
+        marginal_prob_std: A function that takes time t and gives the standard
+          deviation of the perturbation kernel p_{0t}(x(t) | x(0)).
+        channels: The number of channels for feature maps of each resolution.
+        embed_dim: The dimensionality of Gaussian random feature embeddings.
+    """
+    marginal_prob_std: Any
+    channels: Tuple[int] = (32, 64, 128, 256)
+    embed_dim: int = 256
+
+    @nn.compact
+    def __call__(self, x, t):
+        # The swish activation function
+        act = nn.swish
+        # Obtain the Gaussian random feature embedding for t
+        embed = act(nn.Dense(self.embed_dim)(
+            GaussianFourierProjection(embed_dim=self.embed_dim)(t)))
+
+        hs = [None, ] * len(self.channels)
+        # Encoding path
+        hs[0] = nn.Conv(self.channels[0], (3, 3), (1, 1), padding='VALID',
+                        use_bias=False)(x)
+        ## Incorporate information from t
+        hs[0] += Dense(self.channels[0])(embed)
+        ## Group normalization
+        hs[0] = nn.GroupNorm(4)(hs[0])
+        hs[0] = act(hs[0])
+
+        for c, num_channels in enumerate(self.channels[1:]):
+            hs[c + 1] = nn.Conv(num_channels, (3, 3), (2, 2), padding='VALID', use_bias=False)(hs[c])
+            hs[c + 1] += Dense(num_channels)(embed)
+            hs[c + 1] = nn.GroupNorm(num_groups=None, group_size=4)(hs[c + 1])
+            hs[c + 1] = act(hs[c + 1])
+
+        # h2 = nn.Conv(self.channels[1], (3, 3), (2, 2), padding='VALID', use_bias=False)(h1)
+        # h2 += Dense(self.channels[1])(embed)
+        # h2 = nn.GroupNorm()(h2)
+        # h2 = act(h2)
+        #
+        # h3 = nn.Conv(self.channels[2], (3, 3), (2, 2), padding='VALID', use_bias=False)(h2)
+        # h3 += Dense(self.channels[2])(embed)
+        # h3 = nn.GroupNorm()(h3)
+        # h3 = act(h3)
+        #
+        # h4 = nn.Conv(self.channels[3], (3, 3), (2, 2), padding='VALID', use_bias=False)(h3)
+        # h4 += Dense(self.channels[3])(embed)
+        # h4 = nn.GroupNorm()(h4)
+        # h4 = act(h4)
+
+        # Decoding path
+        # h = nn.Conv(self.channels[-2], (3, 3), (1, 1), padding=((2, 2), (2, 2)),
+        #             input_dilation=(2, 2), use_bias=False)(h4)
+
+        channels = list(range(1, len(self.channels)))
+        # for c, channel in enumerate(range(len(self.channels)-1, 0, -1)):
+        for c, rc in zip(channels, reversed(channels)):
+            ## Skip connection from the encoding path
+            representation = hs[rc] if c == 1 else jnp.concatenate([h, hs[rc]], axis=-1)
+
+            h = nn.Conv(self.channels[rc - 1], (3, 3), (1, 1), padding=((2, 2), (2, 2)),
+                        input_dilation=(2, 2), use_bias=False)(representation)
+
+            h += Dense(self.channels[rc - 1])(embed)
+            h = nn.GroupNorm(num_groups=None, group_size=4)(h)
+            h = act(h)
+
+        # ## Skip connection from the encoding path
+        # h += Dense(self.channels[2])(embed)
+        # h = nn.GroupNorm()(h)
+        # h = act(h)
+        # h = nn.Conv(self.channels[1], (3, 3), (1, 1), padding=((2, 3), (2, 3)),
+        #             input_dilation=(2, 2), use_bias=False)(
+        #     jnp.concatenate([h, h3], axis=-1)
+        # )
+        #
+        # h += Dense(self.channels[1])(embed)
+        # h = nn.GroupNorm()(h)
+        # h = act(h)
+        # h = nn.Conv(self.channels[0], (3, 3), (1, 1), padding=((2, 3), (2, 3)),
+        #             input_dilation=(2, 2), use_bias=False)(
+        #     jnp.concatenate([h, h2], axis=-1)
+        # )
+        #
+        # h += Dense(self.channels[0])(embed)
+        # h = nn.GroupNorm()(h)
+        # h = act(h)
         h = nn.Conv(1, (3, 3), (1, 1), padding=((2, 2), (2, 2)))(
             jnp.concatenate([h, h1], axis=-1)
         )
@@ -340,18 +439,22 @@ lr = 1e-4  # @param {'type':'number'}
 rng = jax.random.PRNGKey(0)
 fake_input = jnp.ones((batch_size, 28, 28, 1))
 fake_time = jnp.ones(batch_size)
-score_model = ScoreNet(marginal_prob_std_fn)
+# score_model = ScoreNet(marginal_prob_std_fn)
+#score_model = ScoreNet(marginal_prob_std_fn, channels=(8, 16, 32, 64), embed_dim=64)
+score_model = ScoreNet(marginal_prob_std_fn, channels=(8, 16, 16, 32), embed_dim=32)
+#score_model = TinyScoreNet(marginal_prob_std_fn, channels=(8, 16, 32, 64), embed_dim=64)
 params = score_model.init({'params': rng}, fake_input, fake_time)
 
 dataset = MNIST('.', train=True, transform=transforms.ToTensor(), download=True)
 print(f"We have {len(dataset)} images in our pretty dataset!")
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True) #, num_workers=4)
+data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)  # , num_workers=4)
 
 optimiser = optax.adam(learning_rate=lr)
 opt_state = optimiser.init(params)
 
 train_step_fn = get_train_step_fn(score_model, optimiser, marginal_prob_std_fn)
-tqdm_epoch = tqdm.trange(n_epochs)
+tqdm_dataloader = tqdm(data_loader, position=0, desc="Batch progress")
+tqdm_epoch = trange(n_epochs, position=1, desc="Epoch progress")
 
 assert batch_size % jax.local_device_count() == 0
 data_shape = (jax.local_device_count(), -1, 28, 28, 1)
@@ -360,11 +463,10 @@ data_shape = (jax.local_device_count(), -1, 28, 28, 1)
 params = flax.jax_utils.replicate(params)
 opt_state = flax.jax_utils.replicate(opt_state)
 
-
 for epoch in tqdm_epoch:
     avg_loss = 0.
     num_items = 0
-    for x, y in data_loader:
+    for i, (x, y) in enumerate(tqdm_dataloader):
         x = x.permute(0, 2, 3, 1).numpy().reshape(data_shape)
         rng, *step_rng = jax.random.split(rng, jax.local_device_count() + 1)
         step_rng = jnp.asarray(step_rng)
@@ -374,13 +476,27 @@ for epoch in tqdm_epoch:
         mean_loss = flax.jax_utils.unreplicate(mean_loss)
         avg_loss += mean_loss.item() * x.shape[0] * x.shape[1]
         num_items += x.shape[0] * x.shape[1]
-    # Print the averaged training loss so far.
-    tqdm_epoch.set_description(f'Average Loss (for {num_items} images): {avg_loss / num_items:5f}')
-    # Update the checkpoint after each epoch of training.
-    with tf.io.gfile.GFile('ckpt.flax', 'wb') as fout:
-        fout.write(to_bytes(flax.jax_utils.unreplicate(optimiser)))
+        # tqdm_dataloader.set_description("Batch progress")
+        if i == 10:
+            break
 
-    # ## Sampling with Numerical SDE Solvers
+        # Update the checkpoint after each epoch of training.
+    with tf.io.gfile.GFile('ckpt.flax', 'wb') as fout:
+        # fout.write(to_bytes({"params": flax.jax_utils.unreplicate(params),
+        #                      "opt_state": flax.jax_utils.unreplicate(opt_state)}))
+        # save opt_state and params to file
+        fout.write(to_bytes(flax.jax_utils.unreplicate(params)))
+        # fout.write(to_bytes(flax.jax_utils.unreplicate(optimiser)))
+
+    # Print the averaged training loss so far.
+    tqdm_epoch.set_postfix({"Avg loss": avg_loss/num_items})
+    #tqdm_epoch.set_description(f'Average Loss (for {num_items} images): {avg_loss / num_items:5f}')
+    break
+
+params = flax.jax_utils.unreplicate(params)
+opt_state = flax.jax_utils.unreplicate(opt_state)
+
+# ## Sampling with Numerical SDE Solvers
 # Recall that for any SDE of the form
 # \begin{align*}
 # d \mathbf{x} = \mathbf{f}(\mathbf{x}, t) dt + g(t) d\mathbf{w},
@@ -459,7 +575,7 @@ def Euler_Maruyama_sampler(rng,
     time_steps = jnp.linspace(1., eps, num_steps)
     step_size = time_steps[0] - time_steps[1]
     x = init_x
-    for time_step in tqdm.notebook.tqdm(time_steps):
+    for time_step in tqdm(time_steps):
         batch_time_step = jnp.ones(time_shape) * time_step
         g = diffusion_coeff(time_step)
         mean_x = x + (g ** 2) * pmap_score_fn(score_model,
@@ -530,7 +646,7 @@ def pc_sampler(rng,
     time_steps = jnp.linspace(1., eps, num_steps)
     step_size = time_steps[0] - time_steps[1]
     x = init_x
-    for time_step in tqdm.notebook.tqdm(time_steps):
+    for time_step in tqdm(time_steps):
         batch_time_step = jnp.ones(time_shape) * time_step
         # Corrector step (Langevin MCMC)
         grad = pmap_score_fn(score_model, params, x, batch_time_step)
@@ -586,9 +702,11 @@ def pc_sampler(rng,
 error_tolerance = 1e-5  # @param {'type': 'number'}
 
 
+
 def ode_sampler(rng,
                 score_model,
                 params,
+                #opt_state,
                 marginal_prob_std,
                 diffusion_coeff,
                 batch_size=64,
@@ -658,20 +776,34 @@ sample_batch_size = 64  # @param {'type':'integer'}
 sampler = ode_sampler  # @param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
 
 ## Load the pre-trained checkpoint from disk.
-score_model = ScoreNet(marginal_prob_std_fn)
+score_model = ScoreNet(marginal_prob_std_fn, channels=(8, 16, 16, 32), embed_dim=32)
 fake_input = jnp.ones((sample_batch_size, 28, 28, 1))
 fake_time = jnp.ones((sample_batch_size,))
 rng = jax.random.PRNGKey(0)
-params = score_model.init({'params': rng}, fake_input, fake_time)
-optimiser = flax.optim.Adam().create(params)
-with tf.io.gfile.GFile('ckpt.flax', 'rb') as fin:
-    optimiser = from_bytes(optimiser, fin.read())
+#params = score_model.init({'params': rng}, fake_input, fake_time)
+_ = score_model.init({'params': rng}, fake_input, fake_time)
+
+#lr = 1e-3
+#optimiser = flax.optim.Adam().create(params)
+#optimiser = optax.adam(learning_rate=lr)
+#opt_state = optimiser.init(params)
+
+# with tf.io.gfile.GFile('ckpt.flax', 'rb') as fin:
+#     # read in params from ckpt
+#     params = from_bytes({}, fin.read(),)
+#
+#     par_dict = from_bytes({"params": {}, "opt_state": {}}, fin.read(),)
+#     opt_state = par_dict["opt_state"]
+#     params = par_dict["params"]
+#     #optimiser = from_bytes(optimiser, fin.read())
 
 ## Generate samples using the specified sampler.
 rng, step_rng = jax.random.split(rng)
 samples = sampler(rng,
                   score_model,
-                  optimiser.target,
+                  #optimiser.target,
+                  params,
+                  #opt_state,
                   marginal_prob_std_fn,
                   diffusion_coeff_fn,
                   sample_batch_size)
@@ -679,7 +811,7 @@ samples = sampler(rng,
 ## Sample visualization.
 samples = jnp.clip(samples, 0.0, 1.0)
 samples = jnp.transpose(samples.reshape((-1, 28, 28, 1)), (0, 3, 1, 2))
-get_ipython().run_line_magic('matplotlib', 'inline')
+#get_ipython().run_line_magic('matplotlib', 'inline')
 import matplotlib.pyplot as plt
 
 sample_grid = make_grid(torch.tensor(np.asarray(samples)), nrow=int(np.sqrt(sample_batch_size)))
